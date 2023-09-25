@@ -1,0 +1,14 @@
+[package]
+name = "sqlgen"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1.0.75"
+rustc-hash = "1.1.0"
+smallvec = "1.11.1"
+sqlparser = "0.38.0"
+string-interner = "0.14.0"
+thiserror = "1.0.48"
