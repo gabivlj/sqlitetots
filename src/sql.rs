@@ -310,6 +310,23 @@ impl<'a> Generator<'a> {
         })
     }
 
+    fn assert_table_exists<'b, 'c>(
+        tables: &'b mut ColumnTable<'c>,
+        strings: &mut StringInterner,
+        name: DefaultSymbol,
+    ) -> Result<&'b mut Columns<'c>, GeneratorError> {
+        let column = tables.get_mut(&name).ok_or_else(|| {
+            GeneratorError::TableNotExist(String::from(strings.resolve(name).unwrap()))
+        })?;
+        if let ColumnsKind::View = column.kind {
+            return Err(GeneratorError::IsNotATable(String::from(
+                strings.resolve(name).unwrap(),
+            )));
+        }
+
+        return Ok(column);
+    }
+
     fn process_sql_statement(&mut self, statement: &'a Statement) -> Result<(), GeneratorError> {
         match statement {
             Statement::CreateTable { name, columns, .. } => {
@@ -364,16 +381,9 @@ impl<'a> Generator<'a> {
                 name, operations, ..
             } => {
                 let name = self.intern_symbol(name)?;
-                let mut column = self.tables.get_mut(&name).ok_or_else(|| {
-                    GeneratorError::TableNotExist(String::from(self.strings.resolve(name).unwrap()))
-                })?;
-                if let ColumnsKind::View = column.kind {
-                    return Err(GeneratorError::IsNotATable(String::from(
-                        self.strings.resolve(name).unwrap(),
-                    )));
-                }
-
-                Generator::handle_alter_table_ops(&mut column, &mut self.strings, &operations)?;
+                let column =
+                    Generator::assert_table_exists(&mut self.tables, &mut self.strings, name)?;
+                Generator::handle_alter_table_ops(column, &mut self.strings, &operations)?;
             }
 
             _ => {}
