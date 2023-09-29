@@ -2,10 +2,10 @@ use anyhow::Context;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use sqlparser::ast::{
-    AlterTableOperation, ColumnDef, ColumnOption, ColumnOptionDef, DataType, ObjectName,
-    ObjectType, Statement,
+    AlterTableOperation, ColumnDef, ColumnOption, ColumnOptionDef, DataType, Expr, ObjectName,
+    ObjectType, Statement, Value,
 };
-use sqlparser::dialect::SQLiteDialect;
+use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
 #[derive(Copy, Clone)]
@@ -35,7 +35,8 @@ enum ColumnsKind {
 }
 
 pub fn generate_typescript_types(sql: &str) -> Result<(), GeneratorError> {
-    let ast = Parser::parse_sql(&SQLiteDialect {}, sql).context("parsing sql")?;
+    let dialect = parser::CreateViewIfNotExistsDialect::new();
+    let ast = Parser::parse_sql(&dialect, sql).context("parsing sql")?;
     let mut generator = Generator::new();
     let result = generator.process_sql_statements(&ast);
     // generate anyway
@@ -53,6 +54,8 @@ struct Generator<'a> {
 
 use string_interner::{DefaultSymbol, StringInterner};
 use thiserror::Error;
+
+use crate::parser;
 
 #[derive(Debug)]
 pub struct MultipleGeneratorErrors(Vec<GeneratorError>);
@@ -283,6 +286,30 @@ impl<'a> Generator<'a> {
             if let ColumnOption::NotNull = option.option {
                 return true;
             }
+
+            // Handle the case where there is a default
+            if let ColumnOption::Default(expr) = &option.option {
+                if let Expr::Value(value) = expr {
+                    // if the defualt is null, let's keep finding options
+                    if let Value::Null = value {
+                        continue;
+                    }
+                }
+
+                return true;
+            }
+
+            if let ColumnOption::Unique { is_primary } = &option.option {
+                // technically, primary should allow for null,
+                // however 99% of definitions of PRIMARY assume that insertions fill it with a
+                // value
+                if *is_primary {
+                    return true;
+                }
+
+                // unique value should have not null constraint
+                continue;
+            }
         }
 
         return false;
@@ -306,7 +333,7 @@ impl<'a> Generator<'a> {
         Ok(Column {
             name,
             sql_type: t,
-            nullable: Generator::non_nullable(&column.options),
+            nullable: !Generator::non_nullable(&column.options),
         })
     }
 
