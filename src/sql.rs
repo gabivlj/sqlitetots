@@ -1,4 +1,6 @@
-use anyhow::Context;
+use std::io::Write;
+
+use anyhow::{Context, Result};
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use sqlparser::ast::{
@@ -43,12 +45,21 @@ enum ColumnsKind {
 }
 
 pub fn generate_typescript_types(sql: &str) -> Result<(), GeneratorError> {
+    let mut stdout = std::io::stdout();
+    generate_typescript_types_writer(sql, &mut stdout)?;
+    return Ok(());
+}
+
+pub fn generate_typescript_types_writer(
+    sql: &str,
+    writer: &mut dyn Write,
+) -> Result<(), GeneratorError> {
     let dialect = parser::CreateViewIfNotExistsDialect::new();
     let ast = Parser::parse_sql(&dialect, sql).context("parsing sql")?;
     let mut generator = Generator::new();
     let result = generator.process_sql_statements(&ast);
     // generate anyway
-    generator.generate();
+    generator.generate(writer).context("generating schema")?;
     result.context("processing sql statements")?;
     return Ok(());
 }
@@ -153,35 +164,51 @@ impl Generator {
         return "";
     }
 
-    fn generate_schema_in_typescript(&self, name: DefaultSymbol, columns: &Columns) {
+    fn generate_schema_in_typescript(
+        &self,
+        writer: &mut dyn Write,
+        name: DefaultSymbol,
+        columns: &Columns,
+    ) -> Result<()> {
         use convert_case::{Case, Casing};
         let name = self
             .strings
             .resolve(name)
             .unwrap()
             .to_case(Case::UpperCamel);
-        println!("export const {name} = eg.object({{",);
+        writeln!(writer, "export const {name} = eg.object({{",)?;
         for (i, column) in columns.columns.iter().enumerate() {
             if i > 0 {
-                println!();
+                writeln!(writer)?;
             }
 
-            print!(
+            write!(
+                writer,
                 "  {}: eg.{}{},",
                 self.strings.resolve(column.name).unwrap(),
                 Generator::type_to_ts(column.sql_type),
                 Generator::optional(column.nullable),
-            );
+            )?;
         }
-        println!("\n}});\nexport type {name} = TypeFromCodec<typeof {name}>;");
+        writeln!(
+            writer,
+            "\n}});\nexport type {name} = TypeFromCodec<typeof {name}>;"
+        )?;
+
+        Ok(())
     }
 
-    fn generate(&self) {
-        println!("import {{ eg, TypeFromCodec }} from \"@cloudflare/util-en-garde\";\n");
+    fn generate(&self, writer: &mut dyn Write) -> Result<()> {
+        writeln!(
+            writer,
+            "import {{ eg, TypeFromCodec }} from \"@cloudflare/util-en-garde\";\n"
+        )?;
         for (key, val) in self.tables.iter() {
-            self.generate_schema_in_typescript(*key, val);
-            println!();
+            self.generate_schema_in_typescript(writer, *key, val)?;
+            writeln!(writer)?;
         }
+
+        Ok(())
     }
 
     fn process_sql_statements(&mut self, statements: &[Statement]) -> Result<(), GeneratorError> {
@@ -820,6 +847,41 @@ impl Generator {
             _ => {}
         }
 
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::Result;
+    use std::io::BufWriter;
+
+    // TODO: More test cases that test CREATE VIEW
+
+    #[test]
+    fn simple_case() -> Result<()> {
+        use super::generate_typescript_types_writer;
+        let mut buf = BufWriter::new(Vec::new());
+        assert!(generate_typescript_types_writer(
+            "
+        CREATE TABLE hello_v1 (
+            hello TEXT NOT NULL,
+            hello2 INTEGER,
+            hello3 VARCHAR
+        );
+
+        ALTER TABLE hello_v1 ADD COLUMN hello4 TEXT;
+        ALTER TABLE hello_v1 DROP COLUMN hello3;
+        ",
+            &mut buf,
+        )
+        .is_ok());
+        let bytes = buf.into_inner()?;
+        let string = String::from_utf8(bytes)?;
+        assert_eq!(
+            "import { eg, TypeFromCodec } from \"@cloudflare/util-en-garde\";\n\nexport const HelloV1 = eg.object({\n  hello: eg.string,\n  hello2: eg.number.optional,\n  hello4: eg.string.optional,\n});\nexport type HelloV1 = TypeFromCodec<typeof HelloV1>;\n\n",
+            string
+        );
         Ok(())
     }
 }
