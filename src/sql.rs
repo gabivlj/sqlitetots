@@ -142,7 +142,10 @@ impl<'a> Generator<'a> {
     }
 
     fn generate_col(&self, name: DefaultSymbol, columns: &Columns) {
-        println!("let {} = eg.object({{", self.strings.resolve(name).unwrap());
+        println!(
+            "const {} = eg.object({{",
+            self.strings.resolve(name).unwrap()
+        );
         for (i, column) in columns.columns.iter().enumerate() {
             if i > 0 {
                 println!();
@@ -322,7 +325,14 @@ impl<'a> Generator<'a> {
     }
 
     fn intern_symbol(&mut self, name: &ObjectName) -> Result<DefaultSymbol, GeneratorError> {
-        Ok(self.strings.get_or_intern(
+        Generator::intern_symbol_from_internet(&mut self.strings, name)
+    }
+
+    fn intern_symbol_from_internet(
+        interner: &mut StringInterner,
+        name: &ObjectName,
+    ) -> Result<DefaultSymbol, GeneratorError> {
+        Ok(interner.get_or_intern(
             &(name.0.last().ok_or(GeneratorError::Base(
                 "unexpected table name doesn't have elements",
             ))?)
@@ -416,7 +426,24 @@ impl<'a> Generator<'a> {
                     ));
                 }
             }
-            _ => Err(GeneratorError::Base("expected composite access on column")),
+            Expr::CompoundIdentifier(idents) => {
+                if idents.len() == 1 {
+                    return Err(GeneratorError::AmbiguousReference(idents[0].value.clone()));
+                }
+
+                let column = interner.get_or_intern(
+                    &idents
+                        .last()
+                        .ok_or_else(|| GeneratorError::Base("expected an identifier"))?
+                        .value,
+                );
+                let table = interner.get_or_intern(&idents[idents.len() - 2].value);
+                return Ok((table, column));
+            }
+            _ => {
+                println!("ERROR: {:?}", expr);
+                return Err(GeneratorError::Base("expected composite access on column"));
+            }
         }
     }
 
@@ -441,6 +468,7 @@ impl<'a> Generator<'a> {
                 );
             }
             Statement::CreateView { name, query, .. } => {
+                let view_name = self.intern_symbol(name)?;
                 if let SetExpr::Select(query) = query.as_ref().body.as_ref() {
                     let query_from_first = query
                         .from
@@ -470,8 +498,19 @@ impl<'a> Generator<'a> {
                                 Ok(prev)
                             },
                         );
+
+                    let strings = &mut self.strings;
                     let names = names_result?;
-                    let mut strings = &mut self.strings;
+                    let get_table = |strings: &StringInterner, table_name| {
+                        names.get(&table_name).ok_or_else(|| {
+                            GeneratorError::TableNotExist(
+                                strings
+                                    .resolve(table_name)
+                                    .expect("unreachable")
+                                    .to_string(),
+                            )
+                        })
+                    };
                     let mut columns = ColumnList::new();
                     for column in query.as_ref().projection.iter() {
                         match column {
@@ -479,14 +518,7 @@ impl<'a> Generator<'a> {
                                 let column_alias_name = strings.get_or_intern(&alias.value);
                                 let (table_name, column_name) =
                                     Generator::get_table_and_column_name_from_expr(expr, strings)?;
-                                let table = names.get(&table_name).ok_or_else(|| {
-                                    GeneratorError::TableNotExist(
-                                        strings
-                                            .resolve(table_name)
-                                            .expect("unreachable")
-                                            .to_string(),
-                                    )
-                                })?;
+                                let table = get_table(strings, table_name)?;
                                 let column = table
                                     .columns
                                     .iter()
@@ -499,6 +531,7 @@ impl<'a> Generator<'a> {
                                                 .to_string(),
                                         )
                                     })?;
+                                // copy the column but with a different name due to alias
                                 let column = Column {
                                     name: column_alias_name,
                                     sql_type: column.sql_type,
@@ -507,12 +540,52 @@ impl<'a> Generator<'a> {
                                 columns.push(column);
                             }
 
-                            SelectItem::QualifiedWildcard(name, _) => {}
-                            SelectItem::UnnamedExpr(expr) => {}
-                            SelectItem::Wildcard(_) => {}
+                            SelectItem::QualifiedWildcard(name, _) => {
+                                let table_name =
+                                    Generator::intern_symbol_from_internet(strings, name)?;
+                                let table = get_table(strings, table_name)?;
+                                table
+                                    .columns
+                                    .iter()
+                                    .for_each(|column| columns.push(column.clone()));
+                            }
+                            SelectItem::UnnamedExpr(expr) => {
+                                let (table_name, column_name) =
+                                    Generator::get_table_and_column_name_from_expr(expr, strings)?;
+                                let table = get_table(strings, table_name)?;
+                                let column = table
+                                    .columns
+                                    .iter()
+                                    .find(|column| column.name == column_name)
+                                    .ok_or_else(|| {
+                                        GeneratorError::ColumnNotExist(
+                                            strings
+                                                .resolve(column_name)
+                                                .expect("unreachable")
+                                                .to_string(),
+                                        )
+                                    })?;
+                                columns.push(column.clone());
+                            }
+                            SelectItem::Wildcard(_) => {
+                                names.iter().for_each(|(_, table)| {
+                                    table
+                                        .columns
+                                        .iter()
+                                        .for_each(|column| columns.push(column.clone()))
+                                });
+                            }
                         }
                     }
-                    names.iter().for_each(|item| println!("item: {:?}", item));
+
+                    self.tables.insert(
+                        view_name,
+                        Columns {
+                            kind: ColumnsKind::View,
+                            columns,
+                            last_decl_statement: statement,
+                        },
+                    );
                     return Ok(());
                 }
 
