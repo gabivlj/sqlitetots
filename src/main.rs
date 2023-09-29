@@ -5,7 +5,7 @@ use anyhow::Result;
 
 use clap::Parser;
 
-/// Simple program to greet a person
+/// SQLITE files to TypeScript.
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
