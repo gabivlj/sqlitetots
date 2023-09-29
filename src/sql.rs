@@ -3,8 +3,8 @@ use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use sqlparser::ast::{
     AlterTableOperation, ColumnDef, ColumnOption, ColumnOptionDef, DataType, Expr, FunctionArg,
-    FunctionArgExpr, Join, ObjectName, ObjectType, Query, SelectItem, SetExpr, Statement, Table,
-    TableAlias, TableFactor, TableWithJoins, Value,
+    FunctionArgExpr, ObjectName, ObjectType, SelectItem, SetExpr, Statement, TableAlias,
+    TableFactor, Value,
 };
 use sqlparser::parser::Parser;
 
@@ -15,6 +15,9 @@ pub enum SqliteType {
     Boolean,
 }
 
+/// Column represents a VIEW or TABLE column
+///
+/// name is stored on a StringInterner
 #[derive(Debug, Clone)]
 struct Column {
     name: DefaultSymbol,
@@ -22,12 +25,14 @@ struct Column {
     nullable: bool,
 }
 
+/// ColumnList is a list of columns in a TABLE or VIEW. SmallVec of 16 means it will allocate
+/// 16 Columns in the stack before starting to allocate heap
 type ColumnList = SmallVec<[Column; 16]>;
 
 #[derive(Debug)]
-struct Columns<'a> {
+/// Represents a VIEW or TABLE parsed columns, ready to generate the typescript code.
+struct Columns {
     columns: ColumnList,
-    last_decl_statement: &'a Statement,
     kind: ColumnsKind,
 }
 
@@ -48,11 +53,15 @@ pub fn generate_typescript_types(sql: &str) -> Result<(), GeneratorError> {
     return Ok(());
 }
 
-type ColumnTable<'a> = FxHashMap<DefaultSymbol, Columns<'a>>;
+type ColumnTable = FxHashMap<DefaultSymbol, Columns>;
 
-struct Generator<'a> {
+/// Generator is a TypeScript schema generator.
+///
+/// Right now it only generates types in @cloudflare/util-en-garde format
+///
+struct Generator {
     strings: StringInterner,
-    tables: ColumnTable<'a>,
+    tables: ColumnTable,
 }
 
 use string_interner::{DefaultSymbol, StringInterner};
@@ -120,7 +129,7 @@ pub enum GeneratorError {
     ConvertingValue(Value),
 }
 
-impl<'a> Generator<'a> {
+impl Generator {
     fn new() -> Self {
         Self {
             strings: string_interner::StringInterner::default(),
@@ -144,11 +153,14 @@ impl<'a> Generator<'a> {
         return "";
     }
 
-    fn generate_col(&self, name: DefaultSymbol, columns: &Columns) {
-        println!(
-            "const {} = eg.object({{",
-            self.strings.resolve(name).unwrap()
-        );
+    fn generate_schema_in_typescript(&self, name: DefaultSymbol, columns: &Columns) {
+        use convert_case::{Case, Casing};
+        let name = self
+            .strings
+            .resolve(name)
+            .unwrap()
+            .to_case(Case::UpperCamel);
+        println!("export const {name} = eg.object({{",);
         for (i, column) in columns.columns.iter().enumerate() {
             if i > 0 {
                 println!();
@@ -161,20 +173,18 @@ impl<'a> Generator<'a> {
                 Generator::optional(column.nullable),
             );
         }
-        println!("\n}});");
+        println!("\n}});\nexport type {name} = TypeFromCodec<typeof {name}>;");
     }
 
     fn generate(&self) {
+        println!("import {{ eg, TypeFromCodec }} from \"@cloudflare/util-en-garde\";\n");
         for (key, val) in self.tables.iter() {
-            self.generate_col(*key, val);
+            self.generate_schema_in_typescript(*key, val);
             println!();
         }
     }
 
-    fn process_sql_statements(
-        &mut self,
-        statements: &'a [Statement],
-    ) -> Result<(), GeneratorError> {
+    fn process_sql_statements(&mut self, statements: &[Statement]) -> Result<(), GeneratorError> {
         let mut errors = Vec::with_capacity(statements.len());
         for (i, statement) in statements.iter().enumerate() {
             if let Err(err) = self.process_sql_statement(statement) {
@@ -328,10 +338,10 @@ impl<'a> Generator<'a> {
     }
 
     fn intern_symbol(&mut self, name: &ObjectName) -> Result<DefaultSymbol, GeneratorError> {
-        Generator::intern_symbol_from_internet(&mut self.strings, name)
+        Generator::intern_symbol_from_interner(&mut self.strings, name)
     }
 
-    fn intern_symbol_from_internet(
+    fn intern_symbol_from_interner(
         interner: &mut StringInterner,
         name: &ObjectName,
     ) -> Result<DefaultSymbol, GeneratorError> {
@@ -357,10 +367,10 @@ impl<'a> Generator<'a> {
     }
 
     fn assert_table_exists_mut<'b, 'c>(
-        tables: &'b mut ColumnTable<'c>,
+        tables: &'b mut ColumnTable,
         strings: &mut StringInterner,
         name: DefaultSymbol,
-    ) -> Result<&'b mut Columns<'c>, GeneratorError> {
+    ) -> Result<&'b mut Columns, GeneratorError> {
         let column = tables.get_mut(&name).ok_or_else(|| {
             GeneratorError::TableNotExist(String::from(strings.resolve(name).unwrap()))
         })?;
@@ -374,10 +384,10 @@ impl<'a> Generator<'a> {
     }
 
     fn assert_table_or_view_exists<'b, 'c>(
-        tables: &'b ColumnTable<'c>,
+        tables: &'b ColumnTable,
         strings: &StringInterner,
         name: DefaultSymbol,
-    ) -> Result<&'b Columns<'c>, GeneratorError> {
+    ) -> Result<&'b Columns, GeneratorError> {
         let column = tables.get(&name).ok_or_else(|| {
             GeneratorError::TableNotExist(String::from(strings.resolve(name).unwrap()))
         })?;
@@ -462,6 +472,9 @@ impl<'a> Generator<'a> {
         }
     }
 
+    /// It will try to get an expression inside a SELECT of a VIEW and try to resolve its type.
+    /// name_cast is the name of the column. At the moment this function doesn't resolve
+    /// the column literals, only the other kind of expressions are tried to be parsed here.
     fn try_to_retrieve_column_from_expression(
         strings: &mut StringInterner,
         expr: &Expr,
@@ -533,6 +546,12 @@ impl<'a> Generator<'a> {
                     .0
                     .last()
                     .ok_or_else(|| GeneratorError::Base("expected one identifier"))?;
+
+                // NOTE: Huge assumption here, this code-generator is mainly done for
+                // a Worker + D1 codebase, so if a function is calling json_... safe tu assume
+                // it returns TEXT containing JSON
+                // Another TODO: Worth exploring functions that can create schemas from the JSON call
+                // and create a JSON.parse function
                 if name.value.starts_with("json_") {
                     return Ok(Some(Column {
                         name: name_cast,
@@ -541,6 +560,9 @@ impl<'a> Generator<'a> {
                     }));
                 }
 
+                // NOTE: Not the greatest solution, maybe a way to map functions to
+                // callbacks that generate a Column would be the way to go.
+                // Even a trie would be worth it exploring for this
                 let lowercase_name = name.value.to_lowercase();
                 if lowercase_name.to_lowercase() == "sum" {
                     return Ok(Some(Column {
@@ -592,7 +614,7 @@ impl<'a> Generator<'a> {
         return Ok(None);
     }
 
-    fn process_sql_statement(&mut self, statement: &'a Statement) -> Result<(), GeneratorError> {
+    fn process_sql_statement(&mut self, statement: &Statement) -> Result<(), GeneratorError> {
         match statement {
             Statement::CreateTable { name, columns, .. } => {
                 let mut columns_gen = ColumnList::new();
@@ -607,7 +629,6 @@ impl<'a> Generator<'a> {
                     name,
                     Columns {
                         columns: columns_gen,
-                        last_decl_statement: statement,
                         kind: ColumnsKind::Table,
                     },
                 );
@@ -615,6 +636,13 @@ impl<'a> Generator<'a> {
             Statement::CreateView { name, query, .. } => {
                 let view_name = self.intern_symbol(name)?;
                 if let SetExpr::Select(query) = query.as_ref().body.as_ref() {
+                    // The main idea of this code is:
+                    // 1. Get all table/view names and its aliases on `let names`
+                    // 2. Explore the projection (SELECT <projection>) and see to what type and name
+                    // do the column resolves to, adding it to a list of columns
+                    // 3. Create the view with the list of columns
+                    // We error out if we don't really understand the expression in the column
+                    // Most code that handles that is in `try_to_retrieve_column_from_expression`
                     let query_from_first = query
                         .from
                         .first()
@@ -659,15 +687,18 @@ impl<'a> Generator<'a> {
                     let mut columns = ColumnList::new();
                     for column in query.as_ref().projection.iter() {
                         match column {
-                            // TODO: MOVE THIS ENTIRE MATCH TO Generator::try_to_retrieve_column_from_expression
+                            // TODO: This entire match could be done in Generator::try_to_retrieve_column_from_expression
+                            // and it would simplify a huge amount some things!
                             SelectItem::ExprWithAlias { expr, alias } => {
                                 let column_alias_name = strings.get_or_intern(&alias.value);
+                                // try first an expression that is not a column name
                                 let column_expr =
                                     Generator::try_to_retrieve_column_from_expression(
                                         strings,
                                         expr,
                                         column_alias_name,
                                     )?;
+                                // if it was able to parse an expression, add the column
                                 if let Some(column) = column_expr {
                                     columns.push(column);
                                     continue;
@@ -697,9 +728,10 @@ impl<'a> Generator<'a> {
                                 columns.push(column);
                             }
 
+                            // handle things like: table_name.*
                             SelectItem::QualifiedWildcard(name, _) => {
                                 let table_name =
-                                    Generator::intern_symbol_from_internet(strings, name)?;
+                                    Generator::intern_symbol_from_interner(strings, name)?;
                                 let table = get_table(strings, table_name)?;
                                 table
                                     .columns
@@ -724,6 +756,7 @@ impl<'a> Generator<'a> {
                                     })?;
                                 columns.push(column.clone());
                             }
+                            // .* wildcard. TODO: Maybe check for repeated column names?
                             SelectItem::Wildcard(_) => {
                                 names.iter().for_each(|(_, table)| {
                                     table
@@ -740,7 +773,6 @@ impl<'a> Generator<'a> {
                         Columns {
                             kind: ColumnsKind::View,
                             columns,
-                            last_decl_statement: statement,
                         },
                     );
                     return Ok(());
