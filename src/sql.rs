@@ -2,19 +2,20 @@ use anyhow::Context;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use sqlparser::ast::{
-    AlterTableOperation, ColumnDef, ColumnOption, ColumnOptionDef, DataType, Expr, ObjectName,
-    ObjectType, Statement, Value,
+    AlterTableOperation, ColumnDef, ColumnOption, ColumnOptionDef, DataType, Expr, Join,
+    ObjectName, ObjectType, SelectItem, SetExpr, Statement, Table, TableAlias, TableFactor,
+    TableWithJoins, Value,
 };
-use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub enum SqliteType {
     Integer,
     Text,
     Boolean,
 }
 
+#[derive(Debug, Clone)]
 struct Column {
     name: DefaultSymbol,
     sql_type: SqliteType,
@@ -23,12 +24,14 @@ struct Column {
 
 type ColumnList = SmallVec<[Column; 16]>;
 
+#[derive(Debug)]
 struct Columns<'a> {
     columns: ColumnList,
     last_decl_statement: &'a Statement,
     kind: ColumnsKind,
 }
 
+#[derive(Debug)]
 enum ColumnsKind {
     View,
     Table,
@@ -109,6 +112,9 @@ pub enum GeneratorError {
 
     #[error("column '{0}' doesn't exist")]
     ColumnNotExist(String),
+
+    #[error("ambiguous reference {0}, expected <table_name>.{0}")]
+    AmbiguousReference(String),
 }
 
 impl<'a> Generator<'a> {
@@ -337,7 +343,7 @@ impl<'a> Generator<'a> {
         })
     }
 
-    fn assert_table_exists<'b, 'c>(
+    fn assert_table_exists_mut<'b, 'c>(
         tables: &'b mut ColumnTable<'c>,
         strings: &mut StringInterner,
         name: DefaultSymbol,
@@ -352,6 +358,66 @@ impl<'a> Generator<'a> {
         }
 
         return Ok(column);
+    }
+
+    fn assert_table_or_view_exists<'b, 'c>(
+        tables: &'b ColumnTable<'c>,
+        strings: &StringInterner,
+        name: DefaultSymbol,
+    ) -> Result<&'b Columns<'c>, GeneratorError> {
+        let column = tables.get(&name).ok_or_else(|| {
+            GeneratorError::TableNotExist(String::from(strings.resolve(name).unwrap()))
+        })?;
+        return Ok(column);
+    }
+
+    fn get_table_name_from_table_factor<'b, 'c>(
+        &'b mut self,
+        table: &'c TableFactor,
+    ) -> Result<(DefaultSymbol, DefaultSymbol), GeneratorError> {
+        if let TableFactor::Table { name, alias, .. } = &table {
+            return self.get_table_name_from_table(name, alias);
+        }
+
+        return Err(GeneratorError::Base("expected a simple table name in FROM"));
+    }
+
+    fn get_table_name_from_table<'b, 'c>(
+        &'b mut self,
+        name: &'c ObjectName,
+        alias: &'c Option<TableAlias>,
+    ) -> Result<(DefaultSymbol, DefaultSymbol), GeneratorError> {
+        let table_name = self.intern_symbol(name)?;
+        let alias_name = if let Some(alias) = alias {
+            self.strings.get_or_intern(&alias.name.value)
+        } else {
+            table_name
+        };
+
+        return Ok((table_name, alias_name));
+    }
+
+    fn get_table_and_column_name_from_expr(
+        expr: &Expr,
+        interner: &mut StringInterner,
+    ) -> Result<(DefaultSymbol, DefaultSymbol), GeneratorError> {
+        match expr {
+            Expr::Identifier(identifier) => {
+                return Err(GeneratorError::AmbiguousReference(identifier.value.clone()));
+            }
+            Expr::CompositeAccess { expr, key } => {
+                let table = interner.get_or_intern(&key.value);
+                if let Expr::Identifier(identifier) = expr.as_ref() {
+                    let identifier = interner.get_or_intern(&identifier.value);
+                    return Ok((table, identifier));
+                } else {
+                    return Err(GeneratorError::Base(
+                        "on composite access we expect an identifier, not anything else",
+                    ));
+                }
+            }
+            _ => Err(GeneratorError::Base("expected composite access on column")),
+        }
     }
 
     fn process_sql_statement(&mut self, statement: &'a Statement) -> Result<(), GeneratorError> {
@@ -374,9 +440,85 @@ impl<'a> Generator<'a> {
                     },
                 );
             }
-            Statement::CreateView { name, .. } => {
-                println!("it's a create table! I guess :- ): {name}");
-                Err(GeneratorError::Unimplemented("create view"))?;
+            Statement::CreateView { name, query, .. } => {
+                if let SetExpr::Select(query) = query.as_ref().body.as_ref() {
+                    let query_from_first = query
+                        .from
+                        .first()
+                        .ok_or_else(|| GeneratorError::Base("expected FROM table"))?;
+                    let names: Result<Vec<(DefaultSymbol, DefaultSymbol)>, GeneratorError> =
+                        query_from_first
+                            .joins
+                            .iter()
+                            .map(|el| self.get_table_name_from_table_factor(&el.relation))
+                            .collect();
+                    let mut names = names?;
+                    names.push(self.get_table_name_from_table_factor(&query_from_first.relation)?);
+                    let names_result: Result<FxHashMap<DefaultSymbol, &Columns>, GeneratorError> =
+                        names.iter().fold(
+                            Result::Ok(FxHashMap::default()),
+                            |prev, (name, alias)| {
+                                let mut prev = prev?;
+                                prev.insert(
+                                    *alias,
+                                    Generator::assert_table_or_view_exists(
+                                        &self.tables,
+                                        &self.strings,
+                                        *name,
+                                    )?,
+                                );
+                                Ok(prev)
+                            },
+                        );
+                    let names = names_result?;
+                    let mut strings = &mut self.strings;
+                    let mut columns = ColumnList::new();
+                    for column in query.as_ref().projection.iter() {
+                        match column {
+                            SelectItem::ExprWithAlias { expr, alias } => {
+                                let column_alias_name = strings.get_or_intern(&alias.value);
+                                let (table_name, column_name) =
+                                    Generator::get_table_and_column_name_from_expr(expr, strings)?;
+                                let table = names.get(&table_name).ok_or_else(|| {
+                                    GeneratorError::TableNotExist(
+                                        strings
+                                            .resolve(table_name)
+                                            .expect("unreachable")
+                                            .to_string(),
+                                    )
+                                })?;
+                                let column = table
+                                    .columns
+                                    .iter()
+                                    .find(|column| column.name == column_name)
+                                    .ok_or_else(|| {
+                                        GeneratorError::ColumnNotExist(
+                                            strings
+                                                .resolve(column_name)
+                                                .expect("unreachable")
+                                                .to_string(),
+                                        )
+                                    })?;
+                                let column = Column {
+                                    name: column_alias_name,
+                                    sql_type: column.sql_type,
+                                    nullable: column.nullable,
+                                };
+                                columns.push(column);
+                            }
+
+                            SelectItem::QualifiedWildcard(name, _) => {}
+                            SelectItem::UnnamedExpr(expr) => {}
+                            SelectItem::Wildcard(_) => {}
+                        }
+                    }
+                    names.iter().for_each(|item| println!("item: {:?}", item));
+                    return Ok(());
+                }
+
+                Err(GeneratorError::Base(
+                    "we can't handle other thigs in CREATE VIEW that are not SELECT",
+                ))?;
             }
             Statement::Drop {
                 object_type, names, ..
@@ -409,7 +551,7 @@ impl<'a> Generator<'a> {
             } => {
                 let name = self.intern_symbol(name)?;
                 let column =
-                    Generator::assert_table_exists(&mut self.tables, &mut self.strings, name)?;
+                    Generator::assert_table_exists_mut(&mut self.tables, &mut self.strings, name)?;
                 Generator::handle_alter_table_ops(column, &mut self.strings, &operations)?;
             }
 
