@@ -2,9 +2,9 @@ use anyhow::Context;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use sqlparser::ast::{
-    AlterTableOperation, ColumnDef, ColumnOption, ColumnOptionDef, DataType, Expr, Join,
-    ObjectName, ObjectType, SelectItem, SetExpr, Statement, Table, TableAlias, TableFactor,
-    TableWithJoins, Value,
+    AlterTableOperation, ColumnDef, ColumnOption, ColumnOptionDef, DataType, Expr, FunctionArg,
+    FunctionArgExpr, Join, ObjectName, ObjectType, Query, SelectItem, SetExpr, Statement, Table,
+    TableAlias, TableFactor, TableWithJoins, Value,
 };
 use sqlparser::parser::Parser;
 
@@ -115,6 +115,9 @@ pub enum GeneratorError {
 
     #[error("ambiguous reference {0}, expected <table_name>.{0}")]
     AmbiguousReference(String),
+
+    #[error("can't convert value {0} to sqlite type yet")]
+    ConvertingValue(Value),
 }
 
 impl<'a> Generator<'a> {
@@ -447,6 +450,148 @@ impl<'a> Generator<'a> {
         }
     }
 
+    fn type_from_value(value: &Value) -> Result<Option<SqliteType>, GeneratorError> {
+        match value {
+            Value::Boolean(_) => Ok(Some(SqliteType::Boolean)),
+            Value::SingleQuotedString(_) | Value::DoubleQuotedString(_) => {
+                Ok(Some(SqliteType::Text))
+            }
+            Value::Null => Ok(None),
+            Value::Number(_, _) => Ok(Some(SqliteType::Integer)),
+            _ => Err(GeneratorError::ConvertingValue(value.clone())),
+        }
+    }
+
+    fn try_to_retrieve_column_from_expression(
+        strings: &mut StringInterner,
+        expr: &Expr,
+        name_cast: DefaultSymbol,
+    ) -> Result<Option<Column>, GeneratorError> {
+        match expr {
+            Expr::Subquery(query) => match query.as_ref().body.as_ref() {
+                SetExpr::Select(expr) => {
+                    if expr.projection.len() != 1 {
+                        return Err(GeneratorError::Base(
+                            "can't handle more or less than 1 item in the SELECT projection",
+                        ));
+                    }
+
+                    let projection = expr.projection.last().expect("unreachable");
+                    // TODO: Handle this select by calling recursively try_to_retrieve_column_from_expression after refactoring
+                    match projection {
+                        SelectItem::UnnamedExpr(expr) => {
+                            return Generator::try_to_retrieve_column_from_expression(
+                                strings, expr, name_cast,
+                            );
+                        }
+                        _ => {
+                            return Err(GeneratorError::Base(
+                                "can't handle this expression on SELECT subquery",
+                            ))
+                        }
+                    }
+                }
+                _ => return Err(GeneratorError::Base("can't handle this kind of subquery")),
+            },
+            Expr::Case {
+                results,
+                else_result,
+                ..
+            } => {
+                let nullable = match else_result {
+                    Some(expr) => {
+                        if let Expr::Value(value) = expr.as_ref() {
+                            if let Value::Null = value {
+                                Ok(true)
+                            } else {
+                                Ok(false)
+                            }
+                        } else {
+                            Ok(false)
+                        }
+                    }
+                    None => Err(GeneratorError::Base(
+                        "expect an ELSE clause for CAUSE inside SELECT",
+                    )),
+                }?;
+                if results.len() != 1 {
+                    return Err(GeneratorError::Base("multiple or 0 results in CASE"));
+                }
+
+                let result = results.last().expect("unreachable");
+                let mut res =
+                    Generator::try_to_retrieve_column_from_expression(strings, result, name_cast);
+                if let Ok(Some(value)) = &mut res {
+                    value.nullable = nullable;
+                }
+
+                return res;
+            }
+            Expr::Function(func) => {
+                let name = func
+                    .name
+                    .0
+                    .last()
+                    .ok_or_else(|| GeneratorError::Base("expected one identifier"))?;
+                if name.value.starts_with("json_") {
+                    return Ok(Some(Column {
+                        name: name_cast,
+                        sql_type: SqliteType::Text,
+                        nullable: false,
+                    }));
+                }
+
+                let lowercase_name = name.value.to_lowercase();
+                if lowercase_name.to_lowercase() == "sum" {
+                    return Ok(Some(Column {
+                        name: name_cast,
+                        sql_type: SqliteType::Integer,
+                        nullable: true,
+                    }));
+                }
+
+                if lowercase_name == "ifnull" {
+                    let mut result = Generator::try_to_retrieve_column_from_expression(
+                        strings,
+                        if let FunctionArg::Unnamed(expr) = func.args.last().ok_or_else(|| {
+                            GeneratorError::Base("expected default value on second argument")
+                        })? {
+                            Ok(if let FunctionArgExpr::Expr(expr) = expr {
+                                expr
+                            } else {
+                                Err(GeneratorError::Base("can't handle non Expr args"))?
+                            })
+                        } else {
+                            Err(GeneratorError::Base("can't handle named function args yet"))
+                        }?,
+                        name_cast,
+                    );
+
+                    if let Ok(Some(val)) = &mut result {
+                        val.nullable = false;
+                    }
+
+                    return result;
+                }
+            }
+
+            Expr::Value(value) => {
+                return Ok(if let Some(value) = Generator::type_from_value(value)? {
+                    Some(Column {
+                        name: name_cast,
+                        nullable: false,
+                        sql_type: value,
+                    })
+                } else {
+                    None
+                })
+            }
+            _ => return Ok(None),
+        }
+
+        return Ok(None);
+    }
+
     fn process_sql_statement(&mut self, statement: &'a Statement) -> Result<(), GeneratorError> {
         match statement {
             Statement::CreateTable { name, columns, .. } => {
@@ -514,8 +659,20 @@ impl<'a> Generator<'a> {
                     let mut columns = ColumnList::new();
                     for column in query.as_ref().projection.iter() {
                         match column {
+                            // TODO: MOVE THIS ENTIRE MATCH TO Generator::try_to_retrieve_column_from_expression
                             SelectItem::ExprWithAlias { expr, alias } => {
                                 let column_alias_name = strings.get_or_intern(&alias.value);
+                                let column_expr =
+                                    Generator::try_to_retrieve_column_from_expression(
+                                        strings,
+                                        expr,
+                                        column_alias_name,
+                                    )?;
+                                if let Some(column) = column_expr {
+                                    columns.push(column);
+                                    continue;
+                                }
+
                                 let (table_name, column_name) =
                                     Generator::get_table_and_column_name_from_expr(expr, strings)?;
                                 let table = get_table(strings, table_name)?;
